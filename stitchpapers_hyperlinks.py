@@ -1,7 +1,7 @@
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
-from PyPDF2 import PdfMerger, PdfReader
+from PyPDF2 import PdfMerger, PdfReader, PdfWriter
 from reportlab.lib.colors import indianred, grey
 import tempfile
 import os
@@ -84,15 +84,6 @@ def count_pdf_pages(path):
     except:
         return 0
 
-def estimate_index_pages(index_entries):
-    """Estimate how many pages the index will take"""
-    # Rough calculation: assume each entry takes approximately 2 lines on average
-    # and we can fit about 30-35 lines per page with title and margins
-    lines_per_entry = 2
-    lines_per_page = 30
-    total_lines = len(index_entries) * lines_per_entry + 3  # +3 for title and spacing
-    return max(1, (total_lines + lines_per_page - 1) // lines_per_page)
-
 def create_index_page(index_entries):
     tmp_fd, tmp_path = tempfile.mkstemp(suffix='.pdf')
     os.close(tmp_fd)
@@ -120,6 +111,7 @@ def create_index_page(index_entries):
     for idx, (title, page_number) in enumerate(index_entries, start=1):
         # Wrap text using actual width
         wrapped_lines = simpleSplit(f"{idx}. {title}", "Helvetica", font_size_index, usable_width - 60)
+        
         for i, line in enumerate(wrapped_lines):
             if y < bottom_margin:
                 c.showPage()
@@ -144,6 +136,78 @@ def create_index_page(index_entries):
     c.save()
     return tmp_path
 
+def add_hyperlinks_to_pdf(pdf_path, index_entries, output_path):
+    """Add hyperlinks to the index page after the PDF is fully assembled"""
+    try:
+        from PyPDF2 import PdfWriter, PdfReader
+        from PyPDF2.generic import DictionaryObject, ArrayObject, FloatObject, NameObject, TextStringObject
+        
+        reader = PdfReader(pdf_path)
+        writer = PdfWriter()
+        
+        # Copy all pages to writer
+        for page in reader.pages:
+            writer.add_page(page)
+        
+        # Add links to the first page (index page)
+        if len(writer.pages) > 0:
+            index_page = writer.pages[0]
+            
+            # Calculate approximate positions for each index entry
+            # These values are estimates based on the layout in create_index_page
+            width, height = A4
+            left_margin = inch
+            top_margin = inch
+            font_size_index = 12
+            line_spacing = font_size_index + 6
+            
+            y_start = height - top_margin - 1.5 * 20  # Start after title
+            current_y = y_start
+            
+            for idx, (title, target_page) in enumerate(index_entries):
+                # Create annotation for this line
+                line_height = line_spacing
+                
+                # Create link annotation
+                link_dict = DictionaryObject({
+                    NameObject('/Type'): NameObject('/Annot'),
+                    NameObject('/Subtype'): NameObject('/Link'),
+                    NameObject('/Rect'): ArrayObject([
+                        FloatObject(left_margin),
+                        FloatObject(current_y - line_height),
+                        FloatObject(width - inch),
+                        FloatObject(current_y)
+                    ]),
+                    NameObject('/Dest'): ArrayObject([
+                        writer.pages[target_page - 1].indirect_reference,  # Target page (0-indexed)
+                        NameObject('/XYZ'),
+                        FloatObject(0),
+                        FloatObject(height),
+                        FloatObject(0)
+                    ]),
+                    NameObject('/Border'): ArrayObject([FloatObject(0), FloatObject(0), FloatObject(0)])
+                })
+                
+                # Add annotation to index page
+                if '/Annots' not in index_page:
+                    index_page[NameObject('/Annots')] = ArrayObject()
+                
+                index_page['/Annots'].append(writer._add_object(link_dict))
+                
+                current_y -= line_spacing + 4  # Account for entry spacing
+        
+        # Write the output file
+        with open(output_path, 'wb') as output_file:
+            writer.write(output_file)
+            
+        return True
+    except Exception as e:
+        print(f"Warning: Could not add hyperlinks: {e}")
+        # If hyperlink addition fails, just copy the original file
+        import shutil
+        shutil.copy2(pdf_path, output_path)
+        return False
+
 # Load and parse CSV
 papers = []
 with open(csv_path, newline='', encoding='utf-8') as csvfile:
@@ -160,71 +224,44 @@ with open(csv_path, newline='', encoding='utf-8') as csvfile:
 # Sort newest first
 papers.sort(reverse=True, key=lambda x: x[0])
 
-# First, collect all papers and calculate their page counts
-paper_info = []
+# First create the PDF without hyperlinks
+merger = PdfMerger()
+index_entries = []
+page_counter = 1  # Start with 1 to account for index page
 title_pdf_paths = []
 
 for date, title, pdf_path in papers:
     title_page_path = create_title_page(title)
     title_pages = count_pdf_pages(title_page_path)
     content_pages = count_pdf_pages(pdf_path)
-    
-    paper_info.append({
-        'title': title,
-        'title_page_path': title_page_path,
-        'content_path': pdf_path,
-        'title_pages': title_pages,
-        'content_pages': content_pages
-    })
+
+    # Add to index entries (target page is where title page will be)
+    index_entries.append((title, page_counter + 1))  # +1 because index comes first
+
+    merger.append(title_page_path)
+    merger.append(pdf_path)
+
+    page_counter += title_pages + content_pages
     title_pdf_paths.append(title_page_path)
 
-# Calculate page numbers accounting for index pages
-index_entries = []
-estimated_index_pages = estimate_index_pages([(info['title'], 0) for info in paper_info])
-page_counter = estimated_index_pages  # Start after the index pages
-
-for info in paper_info:
-    # Page number is 1-based and starts after index
-    index_entries.append((info['title'], page_counter + 1))
-    page_counter += info['title_pages'] + info['content_pages']
-
-# Create the actual index page with correct page numbers
+# Create index page and insert at the beginning
 index_page_path = create_index_page(index_entries)
-actual_index_pages = count_pdf_pages(index_page_path)
+merger.merge(0, index_page_path)  # Insert index at beginning
 
-# If our estimation was wrong, recalculate
-if actual_index_pages != estimated_index_pages:
-    # Recalculate page numbers with actual index page count
-    index_entries = []
-    page_counter = actual_index_pages
-    
-    for info in paper_info:
-        index_entries.append((info['title'], page_counter + 1))
-        page_counter += info['title_pages'] + info['content_pages']
-    
-    # Recreate index page with corrected numbers
-    os.remove(index_page_path)
-    index_page_path = create_index_page(index_entries)
-
-# Now merge everything
-merger = PdfMerger()
-
-# Add index page first
-merger.append(index_page_path)
-
-# Add all papers with their title pages
-for info in paper_info:
-    merger.append(info['title_page_path'])
-    merger.append(info['content_path'])
-
-merger.write(output_path)
+# Save to temporary file first
+temp_output = output_path + '.temp'
+merger.write(temp_output)
 merger.close()
 
-# Clean up
-for f in title_pdf_paths + [index_page_path]:
-    os.remove(f)
+# Now add hyperlinks to the assembled PDF
+hyperlinks_added = add_hyperlinks_to_pdf(temp_output, index_entries, output_path)
 
-print(f"✅ Combined PDF created: {output_path}")
-print(f"📄 Index pages: {actual_index_pages}")
-print(f"📚 Total papers: {len(papers)}")
-print(f"📖 Total pages: {page_counter}")
+# Clean up
+for f in title_pdf_paths + [index_page_path, temp_output]:
+    if os.path.exists(f):
+        os.remove(f)
+
+if hyperlinks_added:
+    print(f"✅ Combined PDF created with hyperlinked index: {output_path}")
+else:
+    print(f"✅ Combined PDF created (hyperlinks could not be added): {output_path}")
